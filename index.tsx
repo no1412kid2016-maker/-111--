@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Solar, Lunar } from 'https://esm.sh/lunar-javascript@1.6.12';
-import { Compass, Clock, MapPin, Info, Calendar as CalendarIcon, RotateCcw, Search } from 'lucide-react';
+import { Compass, Clock, MapPin, Info, Calendar as CalendarIcon, RotateCcw, Settings } from 'lucide-react';
 
 // --- Types & Constants ---
 
@@ -25,6 +25,11 @@ type BaziResult = {
     next: { name: string; time: string };
   };
   solarTime: string; // The calculated true solar time used
+  timeDetails: {
+    lmtOffset: number; // minutes
+    eotOffset: number; // minutes
+    totalOffset: number; // minutes
+  }
 };
 
 const ELEMENT_COLORS: Record<string, string> = {
@@ -74,7 +79,6 @@ const ElementIcon = ({ element }: { element: string }) => {
 // --- Helper Functions ---
 
 const getElement = (char: string): string => {
-  // Simple lookup for Stem/Branch elements
   const mapping: Record<string, string> = {
     '甲': '木', '乙': '木', '丙': '火', '丁': '火', '戊': '土', '己': '土', '庚': '金', '辛': '金', '壬': '水', '癸': '水',
     '寅': '木', '卯': '木', '巳': '火', '午': '火', '辰': '土', '戌': '土', '丑': '土', '未': '土', '申': '金', '酉': '金', '亥': '水', '子': '水'
@@ -83,7 +87,6 @@ const getElement = (char: string): string => {
 };
 
 const getHiddenStems = (branch: string): string[] => {
-  // Simplified hidden stems lookup
   const mapping: Record<string, string[]> = {
     '子': ['癸'], '丑': ['己', '癸', '辛'], '寅': ['甲', '丙', '戊'], '卯': ['乙'],
     '辰': ['戊', '乙', '癸'], '巳': ['丙', '戊', '庚'], '午': ['丁', '己'], '未': ['己', '丁', '乙'],
@@ -96,6 +99,24 @@ const formatTime = (date: Date) => {
   return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
 };
 
+/**
+ * Calculate Equation of Time (EOT) in minutes for a given date.
+ * Approximation formula: E = 9.87 sin(2B) - 7.53 cos(B) - 1.5 sin(B)
+ * Where B = 360 * (N - 81) / 365 degrees
+ */
+const getEquationOfTime = (date: Date): number => {
+  const start = new Date(date.getFullYear(), 0, 0);
+  const diff = date.getTime() - start.getTime();
+  const oneDay = 1000 * 60 * 60 * 24;
+  const dayOfYear = Math.floor(diff / oneDay);
+  
+  // B in radians
+  const B = (360 * (dayOfYear - 81) / 365) * (Math.PI / 180);
+  
+  const eot = 9.87 * Math.sin(2 * B) - 7.53 * Math.cos(B) - 1.5 * Math.sin(B);
+  return eot;
+};
+
 // --- Main Component ---
 
 function App() {
@@ -103,17 +124,17 @@ function App() {
   const [date, setDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [time, setTime] = useState<string>(formatTime(new Date()));
   const [useSolarTime, setUseSolarTime] = useState<boolean>(false);
+  const [useLateRat, setUseLateRat] = useState<boolean>(false); // Late Rat Handling
   
   // Location State
   const [cityName, setCityName] = useState<string>('北京');
-  const [longitude, setLongitude] = useState<string>('116.40'); // Default Beijing
+  const [longitude, setLongitude] = useState<string>('116.40');
   
   const [result, setResult] = useState<BaziResult | null>(null);
 
   const handleCityChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const name = e.target.value;
     setCityName(name);
-    // If exact match found in DB, auto-update longitude
     if (CITY_DATA[name]) {
       setLongitude(CITY_DATA[name].toFixed(2));
     }
@@ -125,48 +146,93 @@ function App() {
       const [year, month, day] = date.split('-').map(Number);
       const [hour, minute] = time.split(':').map(Number);
       
-      let solar = Solar.fromYmdHms(year, month, day, hour, minute, 0);
-      let calculatedSolarTimeStr = `${hour.toString().padStart(2,'0')}:${minute.toString().padStart(2,'0')}`;
+      // Base input date (Local Clock Time context)
+      // We use this constructed Date purely for YMDHMS extraction and timestamp math
+      const inputDate = new Date(year, month - 1, day, hour, minute);
 
-      // True Solar Time Correction
+      let adjustedTime = inputDate;
+      let solarTimeStr = `${hour.toString().padStart(2,'0')}:${minute.toString().padStart(2,'0')}`;
+      let lmtOffset = 0;
+      let eotOffset = 0;
+
+      // --- 1. True Solar Time Correction ---
       if (useSolarTime) {
         const long = parseFloat(longitude);
         if (!isNaN(long)) {
-          // 1. Longitude Correction (Mean Solar Time)
-          // Difference from UTC+8 (120 degrees). Each degree is 4 minutes.
-          const offsetMinutes = (long - 120) * 4;
+          // A. Local Mean Time (LMT) Offset
+          // Difference from UTC+8 (120°). 1° = 4 minutes.
+          lmtOffset = (long - 120) * 4;
           
-          const inputDate = new Date(year, month - 1, day, hour, minute);
-          const adjustedTime = new Date(inputDate.getTime() + offsetMinutes * 60000);
+          // B. Equation of Time (EOT) Offset
+          // Correction for Earth's elliptical orbit and axial tilt
+          eotOffset = getEquationOfTime(inputDate);
           
-          // Re-create Solar object with adjusted time
-          solar = Solar.fromYmdHms(
-            adjustedTime.getFullYear(),
-            adjustedTime.getMonth() + 1,
-            adjustedTime.getDate(),
-            adjustedTime.getHours(),
-            adjustedTime.getMinutes(),
-            adjustedTime.getSeconds()
-          );
+          const totalOffsetMinutes = lmtOffset + eotOffset;
           
-          calculatedSolarTimeStr = `${adjustedTime.getHours().toString().padStart(2, '0')}:${adjustedTime.getMinutes().toString().padStart(2, '0')} (LMT)`;
+          // Apply offset to get True Solar Time
+          adjustedTime = new Date(inputDate.getTime() + totalOffsetMinutes * 60000);
+          
+          solarTimeStr = `${adjustedTime.getHours().toString().padStart(2, '0')}:${adjustedTime.getMinutes().toString().padStart(2, '0')}:${adjustedTime.getSeconds().toString().padStart(2, '0')} (真太阳)`;
         }
       }
 
-      const lunar = solar.getLunar();
-      const bazi = lunar.getEightChar();
+      // --- 2. Generate Pillars ---
+      // Solar.fromYmdHms takes YMDHMS. By passing our adjusted TST components, 
+      // we force the library to calculate based on the astronomical solar moment.
+      const solar = Solar.fromYmdHms(
+        adjustedTime.getFullYear(),
+        adjustedTime.getMonth() + 1,
+        adjustedTime.getDate(),
+        adjustedTime.getHours(),
+        adjustedTime.getMinutes(),
+        adjustedTime.getSeconds()
+      );
       
-      // Get Pillars
-      const yearPillar = bazi.getYear();
-      const monthPillar = bazi.getMonth();
-      const dayPillar = bazi.getDay();
-      const hourPillar = bazi.getTime();
+      const lunar = solar.getLunar();
+      let bazi = lunar.getEightChar();
+      
+      // Standard Pillars from library
+      // Note: Library typically rolls Day Pillar at 23:00 if standard config
+      let yearPillarStr = bazi.getYear();
+      let monthPillarStr = bazi.getMonth();
+      let dayPillarStr = bazi.getDay();
+      let hourPillarStr = bazi.getTime();
+      
+      // --- 3. Rat Hour Handling (Early/Late Zi) ---
+      // If "Late Rat Mode" is ON and hour is 23 (Night Rat / Wan Zi):
+      // Requirement: Day Pillar should be CURRENT day, Hour Pillar should be NEXT day's Zi (usually).
+      if (useLateRat && adjustedTime.getHours() === 23) {
+        // Current logic: lunar-javascript has likely already advanced the Day Pillar for >= 23:00.
+        // We need to revert the Day Pillar to the "Previous" day (which is actually the current calendar day before 23:00).
+        
+        // Calculate pillars for 1 hour ago (22:XX) to get the "Current Day" pillar
+        const prevHourDate = new Date(adjustedTime.getTime() - 3600000); 
+        const prevSolar = Solar.fromYmdHms(
+          prevHourDate.getFullYear(),
+          prevHourDate.getMonth() + 1,
+          prevHourDate.getDate(),
+          prevHourDate.getHours(),
+          prevHourDate.getMinutes(),
+          prevHourDate.getSeconds()
+        );
+        const prevLunar = prevSolar.getLunar();
+        const prevBazi = prevLunar.getEightChar();
+        
+        // Override Day Pillar
+        dayPillarStr = prevBazi.getDay();
+        
+        // Keep Hour Pillar as is. 
+        // Standard "Night Rat" theory usually uses the Hour Stem derived from the *next* day (Early Rat),
+        // or uses a specific mapping. lunar-javascript's default `getTime()` for 23:00 
+        // returns the Zi hour of the next day sequence, which is the standard "Wan Zi" result.
+        // Example: Jia Day 23:30 -> Standard is Yi Day, Wu Zi Hour.
+        // Late Rat Mode -> Jia Day, Wu Zi Hour. (Retain Day, Keep Hour).
+      }
 
       // Get Jie Qi (Solar Terms)
       const prevJie = lunar.getPrevJie();
       const nextJie = lunar.getNextJie();
       
-      // Construct Result
       const constructPillar = (pillarStr: string): BaziPillar => {
         const stem = pillarStr[0];
         const branch = pillarStr[1];
@@ -180,17 +246,22 @@ function App() {
       };
 
       setResult({
-        year: constructPillar(yearPillar),
-        month: constructPillar(monthPillar),
-        day: constructPillar(dayPillar),
-        hour: constructPillar(hourPillar),
+        year: constructPillar(yearPillarStr),
+        month: constructPillar(monthPillarStr),
+        day: constructPillar(dayPillarStr),
+        hour: constructPillar(hourPillarStr),
         solarDate: `${solar.getYear()}年${solar.getMonth()}月${solar.getDay()}日`,
         lunarDate: `${lunar.getYearInGanZhi()}年 ${lunar.getMonthInChinese()}月 ${lunar.getDayInChinese()}`,
         jieQi: {
           prev: { name: prevJie.getName(), time: prevJie.getSolar().toYmdHms() },
           next: { name: nextJie.getName(), time: nextJie.getSolar().toYmdHms() }
         },
-        solarTime: calculatedSolarTimeStr
+        solarTime: solarTimeStr,
+        timeDetails: {
+          lmtOffset: parseFloat(lmtOffset.toFixed(2)),
+          eotOffset: parseFloat(eotOffset.toFixed(2)),
+          totalOffset: parseFloat((lmtOffset + eotOffset).toFixed(2))
+        }
       });
 
     } catch (e) {
@@ -211,7 +282,7 @@ function App() {
         {/* Header */}
         <div className="text-center space-y-2">
           <h1 className="text-3xl font-serif-sc font-bold text-gray-800">八字排盘</h1>
-          <p className="text-gray-500 text-sm">Accurate Bazi Calculator</p>
+          <p className="text-gray-500 text-sm">Accurate Bazi Calculator (True Solar Time)</p>
         </div>
 
         {/* Input Card */}
@@ -243,21 +314,31 @@ function App() {
             </div>
 
             <div className="space-y-4 pt-2 border-t border-gray-100">
-              <div className="flex items-center justify-between">
-                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 cursor-pointer">
+              {/* Settings Toggle Area */}
+              <div className="flex flex-col gap-3">
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 cursor-pointer hover:text-stone-900">
                   <input 
                     type="checkbox" 
                     checked={useSolarTime}
                     onChange={(e) => setUseSolarTime(e.target.checked)}
                     className="w-4 h-4 text-stone-600 rounded border-gray-300 focus:ring-stone-500"
                   />
-                  <span>启用真太阳时校正</span>
+                  <span>启用真太阳时校正 (推荐)</span>
+                  {useSolarTime && <span className="ml-auto text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded">精确模式</span>}
                 </label>
-                {useSolarTime && (
-                  <span className="text-xs text-orange-600 font-medium px-2 py-1 bg-orange-50 rounded">
-                     高精度模式
-                  </span>
-                )}
+
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 cursor-pointer hover:text-stone-900">
+                  <input 
+                    type="checkbox" 
+                    checked={useLateRat}
+                    onChange={(e) => setUseLateRat(e.target.checked)}
+                    className="w-4 h-4 text-stone-600 rounded border-gray-300 focus:ring-stone-500"
+                  />
+                  <div className="flex flex-col">
+                    <span>晚子时归入当天 (23:00-00:00)</span>
+                    <span className="text-xs text-gray-400 font-normal">日柱不换，时柱用次日早子</span>
+                  </div>
+                </label>
               </div>
 
               {useSolarTime && (
@@ -297,9 +378,8 @@ function App() {
                        />
                     </div>
                   </div>
-                  <p className="text-xs text-gray-500 mt-2.5 flex gap-1">
-                    <span>*</span>
-                    系统将根据经度计算地方平太阳时 (LMT) 以推算准确时柱。
+                  <p className="text-xs text-gray-500 mt-2.5">
+                    * 系统会自动计算 <strong>经度时差</strong> 与 <strong>均时差 (EOT)</strong>
                   </p>
                 </div>
               )}
@@ -310,7 +390,7 @@ function App() {
               className="w-full py-3 bg-stone-800 hover:bg-stone-900 text-white rounded-xl font-medium transition-all shadow-md active:scale-[0.99] flex justify-center items-center gap-2"
             >
               <RotateCcw size={18} />
-              开始排盘
+              重新排盘
             </button>
           </div>
         </div>
@@ -337,7 +417,16 @@ function App() {
                     <div className="space-y-1 text-gray-700">
                       <p>公历：{result.solarDate}</p>
                       <p>农历：{result.lunarDate}</p>
-                      <p>计算时间：{result.solarTime}</p>
+                      <p className="font-medium text-stone-800">
+                        {result.solarTime}
+                      </p>
+                      {useSolarTime && (
+                         <div className="text-xs text-gray-400 mt-1 pl-1 border-l-2 border-stone-200">
+                           <p>经度时差: {result.timeDetails.lmtOffset > 0 ? '+' : ''}{result.timeDetails.lmtOffset}m</p>
+                           <p>均时差(EOT): {result.timeDetails.eotOffset > 0 ? '+' : ''}{result.timeDetails.eotOffset}m</p>
+                           <p>总修正: {result.timeDetails.totalOffset > 0 ? '+' : ''}{result.timeDetails.totalOffset}m</p>
+                         </div>
+                      )}
                     </div>
                  </div>
                  <div>
