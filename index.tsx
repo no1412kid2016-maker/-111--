@@ -123,7 +123,7 @@ function App() {
   // Form State
   const [date, setDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [time, setTime] = useState<string>(formatTime(new Date()));
-  const [useSolarTime, setUseSolarTime] = useState<boolean>(false);
+  const [useSolarTime, setUseSolarTime] = useState<boolean>(true); // Default true for accuracy
   const [useLateRat, setUseLateRat] = useState<boolean>(false); // Late Rat Handling
   
   // Location State
@@ -146,25 +146,26 @@ function App() {
       const [year, month, day] = date.split('-').map(Number);
       const [hour, minute] = time.split(':').map(Number);
       
-      // Base input date (Local Clock Time context)
-      // We use this constructed Date purely for YMDHMS extraction and timestamp math
+      // 1. Base Input Date (Input is Beijing Time / UTC+8 context)
+      // We use this for Year/Month Pillar calculation because Solar Terms are absolute.
+      // Solar.fromYmdHms creates a point in time defined by these numbers. 
+      // Assuming standard Chinese almanac logic, inputting Beijing Time works best for finding JieQi.
       const inputDate = new Date(year, month - 1, day, hour, minute);
 
-      let adjustedTime = inputDate;
       let solarTimeStr = `${hour.toString().padStart(2,'0')}:${minute.toString().padStart(2,'0')}`;
       let lmtOffset = 0;
       let eotOffset = 0;
+      let adjustedTime = inputDate;
 
-      // --- 1. True Solar Time Correction ---
+      // 2. Calculate True Solar Time (TST)
       if (useSolarTime) {
         const long = parseFloat(longitude);
         if (!isNaN(long)) {
-          // A. Local Mean Time (LMT) Offset
-          // Difference from UTC+8 (120°). 1° = 4 minutes.
+          // A. LMT Offset: (Longitude - 120) * 4 minutes
+          // Note: This logic explicitly assumes the Input Time is Beijing Time (120° E)
           lmtOffset = (long - 120) * 4;
           
-          // B. Equation of Time (EOT) Offset
-          // Correction for Earth's elliptical orbit and axial tilt
+          // B. EOT Offset
           eotOffset = getEquationOfTime(inputDate);
           
           const totalOffsetMinutes = lmtOffset + eotOffset;
@@ -176,62 +177,55 @@ function App() {
         }
       }
 
-      // --- 2. Generate Pillars ---
-      // Solar.fromYmdHms takes YMDHMS. By passing our adjusted TST components, 
-      // we force the library to calculate based on the astronomical solar moment.
-      const solar = Solar.fromYmdHms(
-        adjustedTime.getFullYear(),
-        adjustedTime.getMonth() + 1,
-        adjustedTime.getDate(),
-        adjustedTime.getHours(),
-        adjustedTime.getMinutes(),
-        adjustedTime.getSeconds()
-      );
+      // 3. Generate Pillars - SPLIT STRATEGY
+      // Strategy:
+      // Year/Month Pillar: Use Input Time (Beijing Time). Solar Terms (JieQi) are absolute moments in time.
+      // Day/Hour Pillar: Use True Solar Time. The rotation of earth relative to sun determines day/hour.
       
-      const lunar = solar.getLunar();
-      let bazi = lunar.getEightChar();
+      // A. Standard Solar Object (Beijing Time) for Year/Month
+      const solarStandard = Solar.fromYmdHms(year, month, day, hour, minute, 0);
+      const lunarStandard = solarStandard.getLunar();
+      const baziStandard = lunarStandard.getEightChar();
       
-      // Standard Pillars from library
-      // Note: Library typically rolls Day Pillar at 23:00 if standard config
-      let yearPillarStr = bazi.getYear();
-      let monthPillarStr = bazi.getMonth();
-      let dayPillarStr = bazi.getDay();
-      let hourPillarStr = bazi.getTime();
+      let yearPillarStr = baziStandard.getYear();
+      let monthPillarStr = baziStandard.getMonth();
+
+      // B. TST Solar Object for Day/Hour
+      const tstY = adjustedTime.getFullYear();
+      const tstM = adjustedTime.getMonth() + 1;
+      const tstD = adjustedTime.getDate();
+      const tstH = adjustedTime.getHours();
+      const tstMin = adjustedTime.getMinutes();
+      const tstS = adjustedTime.getSeconds();
       
-      // --- 3. Rat Hour Handling (Early/Late Zi) ---
-      // If "Late Rat Mode" is ON and hour is 23 (Night Rat / Wan Zi):
-      // Requirement: Day Pillar should be CURRENT day, Hour Pillar should be NEXT day's Zi (usually).
-      if (useLateRat && adjustedTime.getHours() === 23) {
-        // Current logic: lunar-javascript has likely already advanced the Day Pillar for >= 23:00.
-        // We need to revert the Day Pillar to the "Previous" day (which is actually the current calendar day before 23:00).
+      const solarTST = Solar.fromYmdHms(tstY, tstM, tstD, tstH, tstMin, tstS);
+      const lunarTST = solarTST.getLunar();
+      const baziTST = lunarTST.getEightChar();
+      
+      let dayPillarStr = baziTST.getDay();
+      let hourPillarStr = baziTST.getTime();
+
+      // 4. Late Rat Handling (23:00 - 00:00)
+      if (useLateRat && tstH === 23) {
+        // Issue: lunar-javascript defaults to moving 23:00+ to the Next Day.
+        // If "Late Rat belongs to Current Day" is checked:
+        // We need the Day Pillar of the Current Day (Day N).
+        // We need the Hour Pillar of the Rat Hour (which is consistent with Day N's sequence).
         
-        // Calculate pillars for 1 hour ago (22:XX) to get the "Current Day" pillar
-        const prevHourDate = new Date(adjustedTime.getTime() - 3600000); 
-        const prevSolar = Solar.fromYmdHms(
-          prevHourDate.getFullYear(),
-          prevHourDate.getMonth() + 1,
-          prevHourDate.getDate(),
-          prevHourDate.getHours(),
-          prevHourDate.getMinutes(),
-          prevHourDate.getSeconds()
-        );
-        const prevLunar = prevSolar.getLunar();
-        const prevBazi = prevLunar.getEightChar();
+        // Fix: Calculate pillar for 00:10 of the *same* TST day sequence.
+        // Since tstD comes from the Date object, if tstH is 23, tstD is still Day N.
+        // But Solar.fromYmdHms(..., 23, ...) will return Day N+1's pillar.
+        // So we create a temp object for Day N, 00:10:00.
+        const solarSameDayRat = Solar.fromYmdHms(tstY, tstM, tstD, 0, 10, 0);
+        const baziSameDayRat = solarSameDayRat.getLunar().getEightChar();
         
-        // Override Day Pillar
-        dayPillarStr = prevBazi.getDay();
-        
-        // Keep Hour Pillar as is. 
-        // Standard "Night Rat" theory usually uses the Hour Stem derived from the *next* day (Early Rat),
-        // or uses a specific mapping. lunar-javascript's default `getTime()` for 23:00 
-        // returns the Zi hour of the next day sequence, which is the standard "Wan Zi" result.
-        // Example: Jia Day 23:30 -> Standard is Yi Day, Wu Zi Hour.
-        // Late Rat Mode -> Jia Day, Wu Zi Hour. (Retain Day, Keep Hour).
+        dayPillarStr = baziSameDayRat.getDay();
+        hourPillarStr = baziSameDayRat.getTime();
       }
 
-      // Get Jie Qi (Solar Terms)
-      const prevJie = lunar.getPrevJie();
-      const nextJie = lunar.getNextJie();
+      // Get Jie Qi (Solar Terms) - Based on Standard Time (User input) for display
+      const prevJie = lunarStandard.getPrevJie();
+      const nextJie = lunarStandard.getNextJie();
       
       const constructPillar = (pillarStr: string): BaziPillar => {
         const stem = pillarStr[0];
@@ -250,8 +244,8 @@ function App() {
         month: constructPillar(monthPillarStr),
         day: constructPillar(dayPillarStr),
         hour: constructPillar(hourPillarStr),
-        solarDate: `${solar.getYear()}年${solar.getMonth()}月${solar.getDay()}日`,
-        lunarDate: `${lunar.getYearInGanZhi()}年 ${lunar.getMonthInChinese()}月 ${lunar.getDayInChinese()}`,
+        solarDate: `${solarStandard.getYear()}年${solarStandard.getMonth()}月${solarStandard.getDay()}日`,
+        lunarDate: `${lunarStandard.getYearInGanZhi()}年 ${lunarStandard.getMonthInChinese()}月 ${lunarStandard.getDayInChinese()}`,
         jieQi: {
           prev: { name: prevJie.getName(), time: prevJie.getSolar().toYmdHms() },
           next: { name: nextJie.getName(), time: nextJie.getSolar().toYmdHms() }
@@ -282,7 +276,7 @@ function App() {
         {/* Header */}
         <div className="text-center space-y-2">
           <h1 className="text-3xl font-serif-sc font-bold text-gray-800">八字排盘</h1>
-          <p className="text-gray-500 text-sm">Accurate Bazi Calculator (True Solar Time)</p>
+          <p className="text-gray-500 text-sm">精准真太阳时排盘</p>
         </div>
 
         {/* Input Card */}
@@ -291,7 +285,7 @@ function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-                  <CalendarIcon size={16} /> 公历日期
+                  <CalendarIcon size={16} /> 公历日期 (北京时间)
                 </label>
                 <input 
                   type="date" 
@@ -302,7 +296,7 @@ function App() {
               </div>
               <div className="space-y-1.5">
                 <label className="text-sm font-medium text-gray-700 flex items-center gap-2">
-                  <Clock size={16} /> 出生时间
+                  <Clock size={16} /> 出生时间 (北京时间)
                 </label>
                 <input 
                   type="time" 
@@ -323,7 +317,7 @@ function App() {
                     onChange={(e) => setUseSolarTime(e.target.checked)}
                     className="w-4 h-4 text-stone-600 rounded border-gray-300 focus:ring-stone-500"
                   />
-                  <span>启用真太阳时校正 (推荐)</span>
+                  <span>启用真太阳时校正 (以北京时间为基准)</span>
                   {useSolarTime && <span className="ml-auto text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded">精确模式</span>}
                 </label>
 
@@ -336,7 +330,7 @@ function App() {
                   />
                   <div className="flex flex-col">
                     <span>晚子时归入当天 (23:00-00:00)</span>
-                    <span className="text-xs text-gray-400 font-normal">日柱不换，时柱用次日早子</span>
+                    <span className="text-xs text-gray-400 font-normal">勾选后：日柱不换，时柱为今日早子</span>
                   </div>
                 </label>
               </div>
@@ -379,7 +373,7 @@ function App() {
                     </div>
                   </div>
                   <p className="text-xs text-gray-500 mt-2.5">
-                    * 系统会自动计算 <strong>经度时差</strong> 与 <strong>均时差 (EOT)</strong>
+                    * 系统以北京时间 (UTC+8) 为基准，自动计算经度时差与均时差。
                   </p>
                 </div>
               )}
@@ -431,7 +425,7 @@ function App() {
                  </div>
                  <div>
                     <h3 className="text-gray-500 font-medium mb-2 flex items-center gap-2">
-                      <Clock size={14} /> 节气参照
+                      <Clock size={14} /> 节气参照 (北京时间)
                     </h3>
                     <div className="space-y-1 text-gray-700">
                       <p><span className="text-stone-400">上节：</span>{result.jieQi.prev.name} {result.jieQi.prev.time}</p>
